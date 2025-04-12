@@ -1,5 +1,5 @@
 # Soluble Dinosaur
-> Hackable training script for text-to-image diffusion model
+> Hackable training script for diffusion model
 > 
 > Now a dinosaur is diffused in lava 🫠
 >
