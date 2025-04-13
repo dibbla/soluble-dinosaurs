@@ -4,7 +4,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from unet2d_blocks import (
+from .unet2d_blocks import (
     ResidualBlock,
     DownsampleBlock,
     UpsampleBlock,
@@ -64,11 +64,3 @@ class SimpleUNet2D(nn.Module):
         x = self.out_conv(x)
         
         return x
-    
-if __name__ == "__main__":
-    # Example usage
-    model = SimpleUNet2D()
-    x = torch.randn(1, 3, 256, 256)  # Batch size of 1, 3 channels, 256x256 image
-    t = torch.randn(1)  # Time embedding
-    output = model(x, t)
-    print(output.shape)  # Should be (1, 3, 256, 256)
