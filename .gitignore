@@ -1,5 +1,7 @@
-# dataset
+# dataset & images
 datasets/
+experiment_log/
+experiments/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
