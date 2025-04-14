@@ -149,7 +149,11 @@ class UpsampleBlock(nn.Module):
         time_emb_dim=128,
     ):
         super().__init__()
-        self.upsample = nn.ConvTranspose2d(in_channels, out_channels, kernel_size=2, stride=2)        
+        # self.upsample = nn.ConvTranspose2d(in_channels, out_channels, kernel_size=2, stride=2) 
+        self.upsample = nn.Sequential(
+            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True),
+            nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1)
+        )       
         # Merge skip connections
         self.merge = nn.Conv2d(out_channels + additional_channels, out_channels, kernel_size=1)        
         self.block1 = ResidualBlock(out_channels, out_channels)

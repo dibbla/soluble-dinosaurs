@@ -8,6 +8,7 @@ from .unet2d_blocks import (
     ResidualBlock,
     DownsampleBlock,
     UpsampleBlock,
+    BottleneckBlock,
 )
 
 class SimpleUNet2D(nn.Module):
@@ -42,7 +43,7 @@ class SimpleUNet2D(nn.Module):
                 UpsampleBlock(out_ch, in_ch, in_ch, groups=groups, time_emb_dim=time_emb_dim)
             )
         
-        self.bottleneck = ResidualBlock(base_channels * (2 ** num_blocks), base_channels * (2 ** num_blocks))
+        self.bottleneck = BottleneckBlock(ch_arrange[-1][1], groups=groups)
         self.out_conv = nn.Conv2d(base_channels, out_channels, kernel_size=3, padding=1)
         
     def forward(self, x, t):
