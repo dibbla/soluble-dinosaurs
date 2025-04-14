@@ -13,13 +13,19 @@ class ResidualBlock(nn.Module):
         in_channels,
         out_channels,
         kernel_size=3,
-        padding=1,
+        padding=None,  # Changed to None so we can auto-calculate
         norm_layer=nn.GroupNorm,
         activation=nn.GELU,
         bias=True,
         groups=1,
     ):
         super().__init__()
+        # Auto-calculate padding to preserve spatial dimensions
+        if padding is None:
+            # For odd kernel sizes, integer division works
+            assert kernel_size % 2 == 1, "kernel_size must be odd to auto-calculate padding"
+            padding = kernel_size // 2
+            
         self.layers = nn.Sequential(
             nn.Conv2d(in_channels, out_channels, kernel_size, padding=padding, bias=bias),
             norm_layer(groups, out_channels),
@@ -64,31 +70,29 @@ class TimeEmbedding(nn.Module):
         return time
     
 class MultiHeadAttentionBlock(nn.Module):
-    """
-    A multi-head attention block that applies self-attention to the input tensor.
-    It uses a linear layer followed by a normalization layer.
-    """
-    def __init__(
-        self,
-        in_channels,
-        out_channels,
-        num_heads=8,
-    ):
+    def __init__(self, in_channels, out_channels, num_heads=8):
         super().__init__()
-        self.attention = nn.MultiheadAttention(embed_dim=in_channels, num_heads=num_heads)
-        self.linear = nn.Linear(in_channels, out_channels)
-        self.norm_layer = nn.LayerNorm(out_channels)
-        self.activation = nn.GELU()
-
+        self.norm = nn.GroupNorm(num_groups=1, num_channels=in_channels)
+        self.qkv = nn.Conv2d(in_channels, in_channels * 3, 1)
+        self.attention = nn.MultiheadAttention(
+            embed_dim=in_channels, num_heads=num_heads, batch_first=True
+        )
+        self.proj = nn.Conv2d(in_channels, out_channels, 1)
+        
     def forward(self, x):
-        batch_size, channels, height, width = x.shape
-        x = x.view(batch_size, channels, height * width).permute(0, 2, 1) # compress spatial dimensions to token embedding
-        x, _ = self.attention(x, x, x)
-        x = self.linear(x)
-        x = self.norm_layer(x)
-        x = x.permute(0, 2, 1).view(batch_size, channels, height, width)
-        x = self.activation(x)
-        return x
+        b, c, h, w = x.shape
+        residual = x
+        
+        x = self.norm(x)
+        
+        qkv = self.qkv(x).reshape(b, 3, c, h*w).permute(1, 0, 3, 2)
+        q, k, v = qkv[0], qkv[1], qkv[2]  # [b, h*w, c]
+        
+        x, _ = self.attention(q, k, v)        
+        x = x.reshape(b, h, w, c).permute(0, 3, 1, 2)
+        x = self.proj(x)
+        
+        return x + residual
     
 class DownsampleBlock(nn.Module):
     """
@@ -175,7 +179,7 @@ class UpsampleBlock(nn.Module):
         time_emb = self.time_emb_transform(time_emb)
         time_emb = time_emb.view(time_emb.shape[0], time_emb.shape[1], 1, 1)
         time_emb = time_emb.expand(-1, -1, out.shape[2], out.shape[3])  
-
+        
         out = torch.cat([out, skip_features], dim=1)
         out = self.merge(out)
         identity = self.skip_connection(out)
@@ -193,21 +197,30 @@ class BottleneckBlock(nn.Module):
     A bottleneck block that contains ResidualBlock and self-attention layers.
     The size is not changed.
     """
-    def __init__(
-        self,
-        in_channels,
-        groups=16,
-    ):
+    def __init__(self, in_channels, groups=16, time_emb_dim=128):
         super().__init__()
         self.block1 = ResidualBlock(in_channels, in_channels)
         self.attention = MultiHeadAttentionBlock(in_channels, in_channels)
         self.block2 = ResidualBlock(in_channels, in_channels)
         
-    def forward(self, x):
+        # Add time embedding
+        self.time_emb = TimeEmbedding(time_emb_dim)
+        self.time_proj = nn.Sequential(
+            nn.Linear(time_emb_dim, in_channels),
+            nn.SiLU(),
+        )
+        
+    def forward(self, x, t):
+        # Add time conditioning
+        time_emb = self.time_emb(t)
+        time_emb = self.time_proj(time_emb)
+        time_emb = time_emb.view(-1, time_emb.shape[1], 1, 1)
+        
         identity = x
         out = self.block1(x)
+        out = out + time_emb  # Add time embedding
         out = self.attention(out)
         out = self.block2(out)
-        out += identity
+        out = out + identity
         return out
 

@@ -19,7 +19,7 @@ class SimpleUNet2D(nn.Module):
         out_channels=3,
         base_channels=32,
         time_emb_dim=128,
-        groups=16,
+        groups=8,
     ):
         super().__init__()
 
@@ -42,7 +42,7 @@ class SimpleUNet2D(nn.Module):
             self.up_blocks.append(
                 UpsampleBlock(out_ch, in_ch, in_ch, groups=groups, time_emb_dim=time_emb_dim)
             )
-        
+
         self.bottleneck = BottleneckBlock(ch_arrange[-1][1], groups=groups)
         self.out_conv = nn.Conv2d(base_channels, out_channels, kernel_size=3, padding=1)
         
@@ -51,12 +51,12 @@ class SimpleUNet2D(nn.Module):
         
         # downsampling
         skip_connections = []
-        for i, down_block in enumerate(self.down_blocks):
+        for down_block in self.down_blocks:
             x, before_pool = down_block(x, t)
             skip_connections.append(before_pool)
 
         # bottleneck
-        x = self.bottleneck(x)
+        x = self.bottleneck(x, t)
 
         # upsampling
         for i, up_block in enumerate(self.up_blocks):
