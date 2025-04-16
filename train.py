@@ -2,11 +2,12 @@
 
 import os
 import torch
+import random
 from datasets import load_dataset
 from torch.utils.data import DataLoader
 import torchvision
 from dotenv import load_dotenv
-from model.unet2d import SimpleUNet2D
+from model.unet2d import UNet2DConfig, SimpleUNet2D
 from train_scheme.ot_flow_matching import OTFlowMatching
 from utils.exp_control import ExperimentController
 from argparse import ArgumentParser
@@ -33,15 +34,31 @@ def main(args):
     )
     dataset.set_format(type="torch", columns=["image"])
     def transform(example):
+        # Resize
         example["image"] = torchvision.transforms.Resize((args.train_size, args.train_size))(example["image"])
+        # Random horizontal flip
+        if random.random() > 0.5:
+            example["image"] = torchvision.transforms.functional.hflip(example["image"])
         return example
     dataset = dataset.map(transform, batched=True)
     train_dataset = dataset["image"]
     exp_controller.logger.info(f"Dataset loaded with {len(train_dataset)} images")
-
-    # load model and optimizer
-    model = SimpleUNet2D(num_blocks=3, in_channels=3, out_channels=3).to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+    
+    # Create config with custom parameters
+    unet_config = UNet2DConfig(
+        in_channels=3,
+        base_channels=32,
+        num_res_blocks=2,
+        attention_layers=(1, 2, 3, 4),
+        dropout=0.0,
+        channel_multiplier=(1, 2, 4, 8),  # This creates a 4-block structure as before
+        time_emb_dim=128,
+        num_heads=4
+    )
+    
+    # Initialize model with config
+    model = SimpleUNet2D(config=unet_config).to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, betas=(0.9, 0.999))
 
     # Log model architecture to TensorBoard
     exp_controller.log_model_graph(model, input_shape=(1, 3, args.train_size, args.train_size))
@@ -91,7 +108,7 @@ def main(args):
         exp_controller.log_metrics({'epoch_avg_loss': epoch_avg_loss}, epoch, phase='train')
         
         # Update best model if needed
-        is_best = exp_controller.update_best_model(model, optimizer, epoch_avg_loss, epoch)
+        # is_best = exp_controller.update_best_model(model, optimizer, epoch_avg_loss, epoch)
         
         # Save regular checkpoint
         if epoch % args.save_every == 0 or epoch == args.epoch - 1:
@@ -123,7 +140,7 @@ if __name__ == "__main__":
     parser.add_argument("--dataset", type=str, default="korexyz/celeba-hq-256x256", help="Dataset to use in HF format")
     parser.add_argument("--model", type=str, default="unet2d", help="Model architecture")
     parser.add_argument("--device", type=str, default="cuda:7", help="Device to use for training")
-    parser.add_argument("--bs", type=int, default=32, help="Batch size")
+    parser.add_argument("--bs", type=int, default=24, help="Batch size")
     parser.add_argument("--epoch", type=int, default=10, help="Number of epochs")
     parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate")
     parser.add_argument("--train_size", type=int, default=48, help="Size of training images")

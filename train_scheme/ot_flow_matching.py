@@ -22,7 +22,7 @@ class OTFlowMatching:
         loss = torch.nn.functional.mse_loss(model_pred, -noise_sample + data_sample)
         return loss
     
-    def generate(self, model, steps=25, noise=None):
+    def generate(self, model, steps=25, noise=None): # vanilla Euler Method
         if noise is None:
             noise = torch.randn(1, 3, 256, 256).to(next(model.parameters()).device)
         t_vals = torch.linspace(0, 1, steps).to(noise.device).unsqueeze(1)
