@@ -1,4 +1,5 @@
 # Soluble Dinosaur
+
 > Hackable training script for (mostly image) diffusion model
 > 
 > Now a dinosaur is diffused in lava 🫠
