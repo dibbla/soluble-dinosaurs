@@ -1,226 +1,154 @@
-# building blocks
+# building blocks for UNet2D
+# ref: https://github.com/openai/improved-diffusion
 
+import math
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
-class ResidualBlock(nn.Module):
+class ResidualTimeBlock(nn.Module):
     """
-    A residual block with 2 convolutional layers and skip connection.
-    It does not downsample the input.
+    A residual block optionally takes time embedding as input in forward method
     """
     def __init__(
         self,
-        in_channels,
-        out_channels,
-        kernel_size=3,
-        padding=None,  # Changed to None so we can auto-calculate
-        norm_layer=nn.GroupNorm,
-        activation=nn.GELU,
-        bias=True,
-        groups=1,
+        in_channels:int,
+        time_emb_dim:int=128,
+        out_channels:int=None,
+        dropout:float=0.0,
+        res_conv:bool=True,
     ):
         super().__init__()
-        # Auto-calculate padding to preserve spatial dimensions
-        if padding is None:
-            # For odd kernel sizes, integer division works
-            assert kernel_size % 2 == 1, "kernel_size must be odd to auto-calculate padding"
-            padding = kernel_size // 2
-            
-        self.layers = nn.Sequential(
-            nn.Conv2d(in_channels, out_channels, kernel_size, padding=padding, bias=bias),
-            norm_layer(groups, out_channels),
-            activation(),
-            nn.Conv2d(out_channels, out_channels, kernel_size, padding=padding, bias=bias),
-            norm_layer(groups, out_channels),
-            activation(),
-        )
-        self.skip_connection = nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=bias)
-        self.norm_layer = norm_layer(groups, out_channels)
-        self.activation = activation()
-
-    def forward(self, x):
-        identity = self.skip_connection(x)
-        out = self.layers(x)
-        out += identity
-        out = self.norm_layer(out)
-        out = self.activation(out)
-        return out
-    
-class TimeEmbedding(nn.Module):
-    """
-    A module that embeds the time step into the input tensor.
-    It uses a linear layer followed by a SILU activation and a normalization layer.
-    """
-    def __init__(
-        self,
-        time_emb_dim,
-    ):
-        super().__init__()
-        assert time_emb_dim % 2 == 0, "time_emb_dim is expected to be even"
+        if out_channels is None:
+            out_channels = in_channels
+        self.in_channels = in_channels
+        self.out_channels = out_channels
         self.time_emb_dim = time_emb_dim
+        self.dropout = dropout
+        self.res_conv = res_conv
 
-    def forward(self, t):
-        # Sinusoidal position embedding
-        half_dim = self.time_emb_dim // 2
-        index = torch.arange(half_dim, dtype=torch.float32, device=t.device)
-        index = 10000 ** (2 * index / half_dim)
-        time = t[:, None] / index[None, :]
-        time = torch.cat((time.sin(), time.cos()), dim=-1)
-        time = time.view(time.shape[0], self.time_emb_dim)
-        return time
-    
-class MultiHeadAttentionBlock(nn.Module):
-    def __init__(self, in_channels, out_channels, num_heads=8):
-        super().__init__()
-        self.norm = nn.GroupNorm(num_groups=1, num_channels=in_channels)
-        self.qkv = nn.Conv2d(in_channels, in_channels * 3, 1)
-        self.attention = nn.MultiheadAttention(
-            embed_dim=in_channels, num_heads=num_heads, batch_first=True
+        # Define the layers of the residual block
+        self.in_conv = nn.Sequential(
+            nn.GroupNorm(32, in_channels),
+            nn.SiLU(),
+            nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1),
         )
-        self.proj = nn.Conv2d(in_channels, out_channels, 1)
+        self.emb_layers = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(
+                time_emb_dim,
+                out_channels,
+            ),
+        )
+        self.out_conv = nn.Sequential(
+            nn.GroupNorm(32, out_channels),
+            nn.SiLU(),
+            nn.Dropout(p=dropout),
+            nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1),
+        )
+
+        # do skip connection
+        if res_conv:
+            self.skip_connect = nn.Conv2d(in_channels, out_channels, kernel_size=1)
+        else:
+            self.skip_connect = nn.Identity()
+
+    def forward(self, x, time_emb=None):
+        """
+        :param x: Input tensor [BxCxHxW]
+        :param time_emb: Time embedding tensor [BxT]
+        :return: Output tensor [BxCxHxW]
+        """
+        h = self.in_conv(x)
+        emb_out = self.emb_layers(time_emb).unsqueeze(2).unsqueeze(3)
+
+        h = h + emb_out
+        h = self.out_conv(h)
+
+        return self.skip_connect(x) + h
+    
+class QKVAttention(nn.Module):
+    def forward(self, qkv):
+        """
+        :param qkv: [Bx(3C)xT], C is the embedding dimension, T is the sequence length
+        :return: [BxCxT]
+        """
+        ch = qkv.shape[1] // 3
+        q, k, v = qkv.chunk(3, dim=1) # BxCxT
         
+        scale = 1 / (ch ** 0.5)
+        weight = torch.bmm(q.transpose(1, 2), k) * scale
+        weight = F.softmax(weight, dim=-1)
+        out = torch.bmm(weight, v.transpose(1, 2)).transpose(1, 2)
+
+        return out
+
+
+class MultiHeadAttentionBlock(nn.Module):
+    def __init__(
+        self,
+        channels:int,
+        num_heads:int=4,
+    ):
+        super().__init__()
+        self.channels = channels
+        self.num_heads = num_heads
+
+        self.norm = nn.GroupNorm(32, channels) 
+        self.qkv = nn.Conv1d(channels, channels * 3, kernel_size=1) # qkv: [Bx(QKV Channel)xHxW]
+        self.attention = QKVAttention() # requires compress to [Bx(3C)x(HxW)]
+        self.out_conv = nn.Conv1d(channels, channels, kernel_size=1) # [BxCxHxW]
+
     def forward(self, x):
         b, c, h, w = x.shape
-        residual = x
-        
-        x = self.norm(x)
-        
-        qkv = self.qkv(x).reshape(b, 3, c, h*w).permute(1, 0, 3, 2)
-        q, k, v = qkv[0], qkv[1], qkv[2]  # [b, h*w, c]
-        
-        x, _ = self.attention(q, k, v)        
-        x = x.reshape(b, h, w, c).permute(0, 3, 1, 2)
-        x = self.proj(x)
-        
-        return x + residual
+        x_skip = x.reshape(b, c, h * w)
+        x = self.norm(x_skip)
+        qkv = self.qkv(x)
+        qkv = qkv.reshape(b * self.num_heads, -1, qkv.shape[2])
+        attn_out = self.attention(qkv)
+        attn_out = attn_out.reshape(b, c, h * w)
+        attn_out = self.out_conv(attn_out)
+        return (attn_out + x_skip).reshape(b, c, h, w) # [BxCxHxW]
     
 class DownsampleBlock(nn.Module):
     """
-    A downsampling block that contains ResidualBlock, self-attention, and pooling layers.
+    apply a conv or pooling layer to downsample the input
     """
-    def __init__(
-        self,
-        in_channels,
-        out_channels, # suppose to be 2 * in_channels
-        groups=16,
-        time_emb_dim=128,
-    ):
+    def __init__(self, channels, use_conv:bool=True):
         super().__init__()
-        self.block1 = ResidualBlock(in_channels, in_channels)
-        self.attention = MultiHeadAttentionBlock(in_channels, in_channels)
-        self.block2 = ResidualBlock(in_channels, in_channels)
-        self.downsample = nn.Conv2d(in_channels, out_channels, kernel_size=2, stride=2) # downsample
-        self.skip_connection = nn.Conv2d(in_channels, in_channels, kernel_size=1)
-        self.norm_layer = nn.GroupNorm(groups, out_channels)
-        self.activation = nn.GELU()
+        self.channels = channels
+        if use_conv:
+            self.downsample = nn.Conv2d(channels, channels, kernel_size=3, stride=2, padding=1)
+        else:
+            self.downsample = nn.AvgPool2d(kernel_size=2, stride=2)
+    def forward(self, x):
+        """
+        :param x: Input tensor [BxCxHxW]
+        :return: Output tensor [BxCx(H/2)x(W/2)]
+        """
+        x = self.downsample(x)
+        return x
 
-        self.time_emb = TimeEmbedding(time_emb_dim)
-        self.time_emb_transform = nn.Sequential(
-            nn.Linear(time_emb_dim, in_channels),
-            nn.SiLU(),
+class SinusoidalPositionEmbed(nn.Module):
+    def __init__(self, dim:int):
+        super().__init__()
+        self.dim = dim
+
+    def forward(self, x):
+        """
+        :param x: [B] or [B,1]
+        :return: [B,dim]
+        """
+        # Ensure input is 2D
+        if len(x.shape) == 1:
+            x = x.unsqueeze(-1)  # [B] -> [B,1]
+        
+        b, t = x.shape
+        half_dim = self.dim // 2
+        emb = torch.exp(
+            torch.arange(half_dim, device=x.device, dtype=torch.float32) * 
+            -(math.log(10000.0) / half_dim)
         )
-
-
-    def forward(self, x, t):
-        # time embedding
-        time_emb = self.time_emb(t)
-        time_emb = self.time_emb_transform(time_emb)
-        time_emb = time_emb.view(time_emb.shape[0], time_emb.shape[1], 1, 1)
-        time_emb = time_emb.expand(-1, -1, x.shape[2], x.shape[3])
-
-        identity = self.skip_connection(x)
-        out = self.block1(x)
-        out = out + time_emb
-        out = self.attention(out)
-        out = self.block2(out)
-        out += identity
-        before_pool = out
-        out = self.downsample(out)
-        out = self.norm_layer(out)
-        out = self.activation(out)
-        return out, before_pool
-
-class UpsampleBlock(nn.Module):
-    """
-    An upsampling block that contains ResidualBlock, self-attention, and upsampling layers.
-    """
-    def __init__(
-        self,
-        in_channels,
-        out_channels, # suppose to be in_channels // 2
-        additional_channels, # for skip connection from downsample blocks
-        groups=16,
-        time_emb_dim=128,
-    ):
-        super().__init__()
-        # self.upsample = nn.ConvTranspose2d(in_channels, out_channels, kernel_size=2, stride=2) 
-        self.upsample = nn.Sequential(
-            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True),
-            nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1)
-        )       
-        # Merge skip connections
-        self.merge = nn.Conv2d(out_channels + additional_channels, out_channels, kernel_size=1)        
-        self.block1 = ResidualBlock(out_channels, out_channels)
-        self.attention = MultiHeadAttentionBlock(out_channels, out_channels)
-        self.block2 = ResidualBlock(out_channels, out_channels)        
-        self.time_emb = TimeEmbedding(time_emb_dim)
-        self.time_emb_transform = nn.Sequential(
-            nn.Linear(time_emb_dim, out_channels),
-            nn.SiLU(),
-        )        
-        self.skip_connection = nn.Conv2d(out_channels, out_channels, kernel_size=1)
-        self.norm_layer = nn.GroupNorm(groups, out_channels)
-        self.activation = nn.GELU()
-
-    def forward(self, x, skip_features, t):
-        out = self.upsample(x)
-
-        time_emb = self.time_emb(t)
-        time_emb = self.time_emb_transform(time_emb)
-        time_emb = time_emb.view(time_emb.shape[0], time_emb.shape[1], 1, 1)
-        time_emb = time_emb.expand(-1, -1, out.shape[2], out.shape[3])  
-        
-        out = torch.cat([out, skip_features], dim=1)
-        out = self.merge(out)
-        identity = self.skip_connection(out)
-        out = self.block1(out)
-        out = out + time_emb
-        out = self.attention(out)
-        out = self.block2(out)
-        out += identity
-        out = self.norm_layer(out)
-        out = self.activation(out)
-        return out
-    
-class BottleneckBlock(nn.Module):
-    """
-    A bottleneck block that contains ResidualBlock and self-attention layers.
-    The size is not changed.
-    """
-    def __init__(self, in_channels, groups=16, time_emb_dim=128):
-        super().__init__()
-        self.block1 = ResidualBlock(in_channels, in_channels)
-        self.attention = MultiHeadAttentionBlock(in_channels, in_channels)
-        self.block2 = ResidualBlock(in_channels, in_channels)
-        
-        # Add time embedding
-        self.time_emb = TimeEmbedding(time_emb_dim)
-        self.time_proj = nn.Sequential(
-            nn.Linear(time_emb_dim, in_channels),
-            nn.SiLU(),
-        )
-        
-    def forward(self, x, t):
-        # Add time conditioning
-        time_emb = self.time_emb(t)
-        time_emb = self.time_proj(time_emb)
-        time_emb = time_emb.view(-1, time_emb.shape[1], 1, 1)
-        
-        identity = x
-        out = self.block1(x)
-        out = out + time_emb  # Add time embedding
-        out = self.attention(out)
-        out = self.block2(out)
-        out = out + identity
-        return out
-
+        emb = x * emb.unsqueeze(0)  # [B,1] * [1,half_dim] -> [B,half_dim]
+        emb = torch.cat((emb.sin(), emb.cos()), dim=-1)  # [B,dim]
+        return emb  # Changed from emb.reshape(b, -1, t) to just emb
